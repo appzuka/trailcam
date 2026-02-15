@@ -11,6 +11,19 @@ struct Config {
     var maxLabelsToScan: Int = 50
     var centerCropScale: Double = 0.6
     var roiGrid: Int = 1
+    var motionROIEnabled: Bool = false
+    var motionThreshold: Float = 0.08
+    var motionMinAreaFraction: Double = 0.002
+    var motionDownscaleMax: Int = 160
+    var perClassThresholds: [String: Float] = [
+        "bird": 0.2,
+        "badger": 0.15,
+        "fox": 0.35,
+        "cat": 0.35,
+        "mouse": 0.18,
+        "squirrel": 0.25
+    ]
+    var badgerOverrideThreshold: Float = 0.12
     var dryRun: Bool = false
 }
 
@@ -61,6 +74,10 @@ Options:
   --max-labels <count>     Max labels to scan per frame (default: 50)
   --center-crop <0-1>      Center-crop scale after full-frame miss (default: 0.6, set to 1 to disable)
   --roi-grid <n>           Grid tiles to scan after misses (default: 1, values 1-4)
+  --motion-roi             Enable motion-based ROI crop between frames
+  --motion-threshold <0-1> Pixel diff threshold for motion ROI (default: 0.08)
+  --motion-min-area <0-1>  Minimum ROI area fraction to accept (default: 0.002)
+  --motion-downscale <px>  Max downscale dimension for motion ROI (default: 160)
   --log-labels             Print matched label and confidence per file; if no match, print top labels
   --log-top <count>        Count of labels to show when no match (default: 5)
   --dry-run                Show planned moves without changing files
@@ -75,7 +92,8 @@ func usageError(_ message: String? = nil) -> RecognizeError {
 }
 
 func isMP4File(_ url: URL) -> Bool {
-    return url.pathExtension.lowercased() == "mp4"
+    let ext = url.pathExtension.lowercased()
+    return ext == "mp4" || ext == "mov"
 }
 
 func classifyImage(in cgImage: CGImage) throws -> [VNClassificationObservation] {
@@ -99,21 +117,49 @@ struct MatchResult {
 
 func scanObservations(_ observations: [VNClassificationObservation], source: String, config: Config) -> MatchResult? {
     let maxCount = min(config.maxLabelsToScan, observations.count)
+
+    var bestByAnimal: [String: MatchResult] = [:]
+
     for observation in observations.prefix(maxCount) {
-        guard observation.confidence >= config.confidenceThreshold else { continue }
         let identifier = observation.identifier.lowercased()
         for matcher in animalMatchers {
             if matcher.aliases.contains(where: { identifier.contains($0) }) {
-                return MatchResult(
+                let candidate = MatchResult(
                     animal: matcher.animal,
                     label: observation.identifier,
                     confidence: observation.confidence,
                     source: source
                 )
+                if let current = bestByAnimal[matcher.animal] {
+                    if candidate.confidence > current.confidence {
+                        bestByAnimal[matcher.animal] = candidate
+                    }
+                } else {
+                    bestByAnimal[matcher.animal] = candidate
+                }
+                break
             }
         }
     }
-    return nil
+
+    if let badger = bestByAnimal["badger"], badger.confidence >= config.badgerOverrideThreshold {
+        return badger
+    }
+
+    var best: MatchResult?
+    for match in bestByAnimal.values {
+        let threshold = config.perClassThresholds[match.animal] ?? config.confidenceThreshold
+        guard match.confidence >= threshold else { continue }
+        if let currentBest = best {
+            if match.confidence > currentBest.confidence {
+                best = match
+            }
+        } else {
+            best = match
+        }
+    }
+
+    return best
 }
 
 func updateBestLabels(_ observations: [VNClassificationObservation], bestLabels: inout [String: Float], limit: Int) {
@@ -154,9 +200,105 @@ func gridCropRects(for image: CGImage, grid: Int) -> [CGRect] {
     return rects
 }
 
-func detectAnimal(in fileURL: URL, fileName: String, config: Config) throws -> String? {
+func grayscaleBuffer(for image: CGImage, maxDimension: Int) -> (width: Int, height: Int, bytes: [UInt8])? {
+    guard maxDimension > 0 else { return nil }
+    let width = image.width
+    let height = image.height
+    guard width > 0, height > 0 else { return nil }
+
+    let maxSide = max(width, height)
+    let scale = Double(maxDimension) / Double(maxSide)
+    let targetWidth = max(1, Int(Double(width) * scale))
+    let targetHeight = max(1, Int(Double(height) * scale))
+
+    var pixels = [UInt8](repeating: 0, count: targetWidth * targetHeight)
+    let colorSpace = CGColorSpace(name: CGColorSpace.genericGrayGamma2_2) ?? CGColorSpaceCreateDeviceGray()
+    guard let context = CGContext(
+        data: &pixels,
+        width: targetWidth,
+        height: targetHeight,
+        bitsPerComponent: 8,
+        bytesPerRow: targetWidth,
+        space: colorSpace,
+        bitmapInfo: CGImageAlphaInfo.none.rawValue
+    ) else {
+        return nil
+    }
+
+    context.interpolationQuality = .low
+    context.draw(image, in: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+    return (targetWidth, targetHeight, pixels)
+}
+
+func motionROI(previous: CGImage, current: CGImage, config: Config) -> CGRect? {
+    guard previous.width == current.width, previous.height == current.height else {
+        return nil
+    }
+    guard let prevBuffer = grayscaleBuffer(for: previous, maxDimension: config.motionDownscaleMax),
+          let currBuffer = grayscaleBuffer(for: current, maxDimension: config.motionDownscaleMax),
+          prevBuffer.width == currBuffer.width,
+          prevBuffer.height == currBuffer.height else {
+        return nil
+    }
+
+    let width = prevBuffer.width
+    let height = prevBuffer.height
+    let threshold = UInt8(max(0, min(255, Int(config.motionThreshold * 255))))
+
+    var minX = width
+    var minY = height
+    var maxX = -1
+    var maxY = -1
+
+    for y in 0..<height {
+        let rowStart = y * width
+        for x in 0..<width {
+            let index = rowStart + x
+            let a = prevBuffer.bytes[index]
+            let b = currBuffer.bytes[index]
+            let diff = a > b ? a - b : b - a
+            if diff > threshold {
+                if x < minX { minX = x }
+                if y < minY { minY = y }
+                if x > maxX { maxX = x }
+                if y > maxY { maxY = y }
+            }
+        }
+    }
+
+    if maxX < minX || maxY < minY {
+        return nil
+    }
+
+    let roiWidth = maxX - minX + 1
+    let roiHeight = maxY - minY + 1
+    let areaFraction = Double(roiWidth * roiHeight) / Double(width * height)
+    if areaFraction < config.motionMinAreaFraction {
+        return nil
+    }
+
+    let scaleX = Double(current.width) / Double(width)
+    let scaleY = Double(current.height) / Double(height)
+    var rect = CGRect(
+        x: Double(minX) * scaleX,
+        y: Double(minY) * scaleY,
+        width: Double(roiWidth) * scaleX,
+        height: Double(roiHeight) * scaleY
+    )
+
+    let padX = rect.width * 0.1
+    let padY = rect.height * 0.1
+    rect = rect.insetBy(dx: -padX, dy: -padY)
+
+    let maxRect = CGRect(x: 0, y: 0, width: current.width, height: current.height)
+    let clamped = rect.intersection(maxRect).integral
+    return clamped.isNull ? nil : clamped
+}
+
+func detectAnimal(in fileURL: URL, fileName: String, config: Config) async throws -> String? {
     let asset = AVAsset(url: fileURL)
-    let durationSeconds = CMTimeGetSeconds(asset.duration)
+    let duration = try await asset.load(.duration)
+    let durationSeconds = CMTimeGetSeconds(duration)
     guard durationSeconds.isFinite, durationSeconds > 0 else {
         return nil
     }
@@ -173,6 +315,7 @@ func detectAnimal(in fileURL: URL, fileName: String, config: Config) throws -> S
     }
 
     var bestLabels: [String: Float] = [:]
+    var previousImage: CGImage?
 
     for time in times {
         var actualTime = CMTime.zero
@@ -192,6 +335,24 @@ func detectAnimal(in fileURL: URL, fileName: String, config: Config) throws -> S
                     print("Match \(fileName) at \(timeString)s [\(match.source)]: \(match.label) (\(confidence)) -> \(match.animal)")
                 }
                 return match.animal
+            }
+
+            if config.motionROIEnabled, let previousImage,
+               let motionRect = motionROI(previous: previousImage, current: cgImage, config: config),
+               let motionCrop = cgImage.cropping(to: motionRect) {
+                let motionResults = try classifyImage(in: motionCrop)
+                if config.logLabels {
+                    updateBestLabels(motionResults, bestLabels: &bestLabels, limit: config.logTopLabelsCount)
+                }
+                if let match = scanObservations(motionResults, source: "motion-roi", config: config) {
+                    if config.logLabels {
+                        let timeSeconds = CMTimeGetSeconds(actualTime)
+                        let timeString = timeSeconds.isFinite ? String(format: "%.2f", timeSeconds) : "unknown"
+                        let confidence = String(format: "%.2f", match.confidence)
+                        print("Match \(fileName) at \(timeString)s [\(match.source)]: \(match.label) (\(confidence)) -> \(match.animal)")
+                    }
+                    return match.animal
+                }
             }
 
             if config.centerCropScale < 1, let cropRect = centerCropRect(for: cgImage, scale: config.centerCropScale),
@@ -230,6 +391,7 @@ func detectAnimal(in fileURL: URL, fileName: String, config: Config) throws -> S
                     }
                 }
             }
+            previousImage = cgImage
         } catch {
             continue
         }
@@ -324,6 +486,26 @@ func parseArguments(_ args: [String]) throws -> ParsedArguments {
                 throw usageError("Invalid --roi-grid value.")
             }
             config.roiGrid = value
+        case "--motion-roi":
+            config.motionROIEnabled = true
+        case "--motion-threshold":
+            index += 1
+            guard index < args.count, let value = Float(args[index]), value >= 0, value <= 1 else {
+                throw usageError("Invalid --motion-threshold value.")
+            }
+            config.motionThreshold = value
+        case "--motion-min-area":
+            index += 1
+            guard index < args.count, let value = Double(args[index]), value >= 0, value <= 1 else {
+                throw usageError("Invalid --motion-min-area value.")
+            }
+            config.motionMinAreaFraction = value
+        case "--motion-downscale":
+            index += 1
+            guard index < args.count, let value = Int(args[index]), value >= 16 else {
+                throw usageError("Invalid --motion-downscale value.")
+            }
+            config.motionDownscaleMax = value
         case "--log-labels":
             config.logLabels = true
         case "--log-top":
@@ -355,7 +537,7 @@ func parseArguments(_ args: [String]) throws -> ParsedArguments {
     return ParsedArguments(inputURL: inputURL, config: config)
 }
 
-func run() throws {
+func run() async throws {
     let parsed = try parseArguments(CommandLine.arguments)
     let inputURL = parsed.inputURL
     let config = parsed.config
@@ -368,21 +550,21 @@ func run() throws {
     let fileManager = FileManager.default
     let items = try fileManager.contentsOfDirectory(at: inputURL, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])
 
-    let mp4Files = items.filter { url in
+    let videoFiles = items.filter { url in
         guard isMP4File(url) else { return false }
         let values = try? url.resourceValues(forKeys: [.isRegularFileKey])
         return values?.isRegularFile == true
     }
 
-    if mp4Files.isEmpty {
-        print("No MP4 files found in \(inputURL.path)")
+    if videoFiles.isEmpty {
+        print("No MP4 or MOV files found in \(inputURL.path)")
         return
     }
 
-    for fileURL in mp4Files {
+    for fileURL in videoFiles {
         let fileName = fileURL.lastPathComponent
         do {
-            if let animal = try detectAnimal(in: fileURL, fileName: fileName, config: config) {
+            if let animal = try await detectAnimal(in: fileURL, fileName: fileName, config: config) {
                 let targetDir = inputURL.appendingPathComponent(animal, isDirectory: true)
                 let destination = uniqueDestinationURL(in: targetDir, fileName: fileName, fileManager: fileManager)
                 if config.dryRun {
@@ -403,12 +585,17 @@ func run() throws {
     }
 }
 
-do {
-    try run()
-} catch let error as RecognizeError {
-    printError(error.description)
-    exit(1)
-} catch {
-    printError("Unexpected error: \(error)")
-    exit(1)
+@main
+struct Recognize {
+    static func main() async {
+        do {
+            try await run()
+        } catch let error as RecognizeError {
+            printError(error.description)
+            exit(1)
+        } catch {
+            printError("Unexpected error: \(error)")
+            exit(1)
+        }
+    }
 }
