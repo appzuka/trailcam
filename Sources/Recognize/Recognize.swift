@@ -1063,6 +1063,13 @@ func parseCommand(_ args: [String]) throws -> Command {
             index += 1
         }
 
+        if labelStudioToken == nil {
+            let envToken = ProcessInfo.processInfo.environment["LS_TOKEN"] ?? ""
+            if !envToken.isEmpty {
+                labelStudioToken = envToken
+            }
+        }
+
         guard let modelPath, let fromName, let toName else {
             throw usageError("Usage: recognize ls-backend --model <model_path> --from-name <name> --to-name <name> [options]")
         }
