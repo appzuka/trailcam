@@ -1,0 +1,1 @@
+docker run -it -e LOCAL_FILES_SERVING_ENABLED=true -e LABEL_STUDIO_LOCAL_FILES_DOCUMENT_ROOT=/data -p 8080:8080 -v /Volumes/Samsung\ 2TB/Trailcam/labelling/images:/data/local-files/images -v /Volumes/Samsung\ 2TB/Trailcam/mydata:/label-studio/data heartexlabs/label-studio:latest
