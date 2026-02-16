@@ -1,3 +1,6 @@
 /.build/
 /source/
 /training/
+/pytorch/.venv/
+/pytorch/models/
+/Models/
