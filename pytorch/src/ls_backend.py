@@ -230,7 +230,7 @@ def set_full_resolution(model):
 def load_model(checkpoint_path: Path, device: torch.device):
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     architecture = checkpoint.get("architecture")
-    if architecture and architecture != "fasterrcnn":
+    if architecture and architecture not in ("fasterrcnn", "fasterrcnn_resnet50_fpn"):
         raise RuntimeError(f"Checkpoint architecture '{architecture}' is not supported by this backend.")
     class_names = checkpoint.get("class_names", [])
     num_classes = checkpoint.get("num_classes") or (len(class_names) + 1)
@@ -455,10 +455,14 @@ class BackendHandler(BaseHTTPRequestHandler):
             self._send_json({"model_version": self.server.model_version})
             return
 
-        if self.path.rstrip("/") in ("/train", "/webhook"):
+        if self.path.rstrip("/") == "/train":
             payload = self._parse_json(body)
             message = self.server.training.start(payload)
             self._send_json({"status": message})
+            return
+
+        if self.path.rstrip("/") == "/webhook":
+            self._send_json({"status": "ok"})
             return
 
         if self.path.rstrip("/") == "/predict":

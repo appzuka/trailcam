@@ -159,6 +159,8 @@ class COCODataset(Dataset):
         decoded = decoded.lstrip("/")
         if decoded.startswith("local-files/"):
             decoded = decoded[len("local-files/") :]
+        while decoded.startswith("images/"):
+            decoded = decoded[len("images/") :]
 
         return decoded
 

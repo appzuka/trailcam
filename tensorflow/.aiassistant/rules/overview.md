@@ -1,3 +1,7 @@
+---
+apply: always
+---
+
 # TensorFlow implementation
 
 This directory contains a TensorFlow/KerasCV object detection pipeline (RetinaNet) that mirrors the PyTorch functionality: training on COCO exports, inference on images, and a Label Studio backend with `/predict`, `/train`, and `/webhook` routes.
@@ -33,54 +37,58 @@ Use the official TensorFlow GPU build for your CUDA version (see TensorFlow inst
 ## Training
 Script: `tensorflow/src/train.py`
 
-Assume running from the repo root:
+Assume running from tensorflow:
 ```
-python tensorflow/src/train.py \
-  --coco-json training/trainingset1/result.json \
+python src/train.py \
+  --coco-json ../training/trainingset1/result.json \
   --images-dir /Volumes/2TB/Trailcam/labelling/images \
-  --output tensorflow/models/animals_retinanet.weights.h5 \
+  --output models/animals_retinanet.weights.h5 \
   --epochs 10 \
-  --batch-size 2
+  --batch-size 2 \
+  --image-size 640
 ```
 Notes:
 - `--device auto` is the default and will pick GPU if available.
 - Training saves weights to the path you pass and writes metadata to a sibling `.json` file.
+- Training uses a fixed square resize (`--image-size`, default 640) to avoid dynamic-shape errors in the label encoder.
 
 ## Inference
 Script: `tensorflow/src/infer.py`
 
 Single image example:
 ```
-python tensorflow/src/infer.py \
-  --model tensorflow/models/animals_retinanet.weights.h5 \
+python src/infer.py \
+  --model models/animals_retinanet.weights.h5 \
   --image ./images/example.jpg \
   --score-threshold 0.4 \
-  --output-dir tensorflow/outputs
+  --output-dir outputs
 ```
 
 Batch directory example:
 ```
-python tensorflow/src/infer.py \
-  --model tensorflow/models/animals_retinanet.weights.h5 \
+python src/infer.py \
+  --model models/animals_retinanet.weights.h5 \
   --images-dir ./images \
   --score-threshold 0.4
 ```
 
 Copy recognized images into `recognized/high`, `recognized/medium`, `recognized/low`, or `recognized/none`:
 ```
-python tensorflow/src/infer.py \
-  --model tensorflow/models/animals_retinanet.weights.h5 \
+python src/infer.py \
+  --model models/animals_retinanet.weights.h5 \
   --images-dir ./images \
   --copy-recognized
 ```
+Inference will resize to the `image_size` saved in metadata by default (override with `--image-size`).
+Use `--image-size 0` to disable resizing for inference.
 
 ## Label Studio backend
 Script: `tensorflow/src/ls_backend.py`
 
 Run the backend (defaults to `http://localhost:9091`):
 ```
-python tensorflow/src/ls_backend.py \
-  --model tensorflow/models/animals_retinanet.weights.h5 \
+python src/ls_backend.py \
+  --model models/animals_retinanet.weights.h5 \
   --from-name label \
   --to-name image \
   --label-studio-url http://localhost:8080 \

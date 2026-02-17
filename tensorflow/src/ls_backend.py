@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import keras_cv
+import numpy as np
 import tensorflow as tf
 
 from utils import build_dataset, build_model, load_image, preprocess_image, resolve_device, safe_label
@@ -41,6 +42,7 @@ def parse_args():
     parser.add_argument("--weight-decay", type=float, default=0.0005)
     parser.add_argument("--device", default="cpu", choices=["cpu", "gpu"])
     parser.add_argument("--images-root", help="Override images root when training")
+    parser.add_argument("--image-size", type=int, default=640, help="Resize images to a fixed square size for training/inference")
     return parser.parse_args()
 
 
@@ -217,22 +219,52 @@ def load_metadata(model_path: Path, metadata_path: Path | None) -> Dict:
     return json.loads(metadata_path.read_text())
 
 
-def predict(model, class_names, image_path: Path, threshold: float):
+def _to_numpy(value):
+    if value is None:
+        return None
+    if hasattr(value, "numpy"):
+        return value.numpy()
+    if isinstance(value, np.ndarray):
+        return value
+    return np.array(value)
+
+
+def predict(model, class_names, image_path: Path, threshold: float, image_size: int | None):
     image_tensor = preprocess_image(load_image(image_path))
-    batch = tf.expand_dims(image_tensor, axis=0)
-    predictions = model.predict(batch, verbose=0)[0]
+    original_shape = tf.shape(image_tensor)
+    original_height = tf.cast(original_shape[0], tf.float32)
+    original_width = tf.cast(original_shape[1], tf.float32)
+    scale_x = 1.0
+    scale_y = 1.0
+    if image_size and image_size > 0:
+        resized = tf.image.resize(image_tensor, (image_size, image_size))
+        scale_x = original_width / float(image_size)
+        scale_y = original_height / float(image_size)
+        batch = tf.expand_dims(resized, axis=0)
+    else:
+        batch = tf.expand_dims(image_tensor, axis=0)
+    predictions = model.predict(batch, verbose=0)
     boxes = predictions.get("boxes")
     classes = predictions.get("classes")
-    scores = predictions.get("confidence") or predictions.get("scores")
+    scores = predictions.get("confidence")
+    if scores is None:
+        scores = predictions.get("scores")
     if boxes is None or classes is None or scores is None:
         return []
 
-    boxes = boxes.numpy()
-    classes = classes.numpy()
-    scores = scores.numpy()
+    boxes = _to_numpy(boxes)
+    classes = _to_numpy(classes)
+    scores = _to_numpy(scores)
 
-    width = float(tf.shape(image_tensor)[1].numpy())
-    height = float(tf.shape(image_tensor)[0].numpy())
+    if len(boxes.shape) == 3:
+        boxes = boxes[0]
+    if len(classes.shape) == 2:
+        classes = classes[0]
+    if len(scores.shape) == 2:
+        scores = scores[0]
+
+    width = float(original_width.numpy())
+    height = float(original_height.numpy())
 
     results = []
     for box, cls, score in zip(boxes, classes, scores):
@@ -244,6 +276,10 @@ def predict(model, class_names, image_path: Path, threshold: float):
         else:
             label = class_names[label_index - 1]
         x1, y1, x2, y2 = box.tolist()
+        x1 *= float(scale_x)
+        x2 *= float(scale_x)
+        y1 *= float(scale_y)
+        y2 *= float(scale_y)
         results.append(
             {
                 "label": label,
@@ -267,14 +303,18 @@ def train_model(
     batch_size: int,
     lr: float,
     weight_decay: float,
+    image_size: int,
 ):
-    dataset, class_names, cat_id_to_contig, _ = build_dataset(
+    dataset, class_names, cat_id_to_contig, record_count = build_dataset(
         coco_json,
         images_dir,
         batch_size=batch_size,
         shuffle=True,
+        image_size=image_size,
     )
     num_classes = len(class_names) + 1
+    steps_per_epoch = max(1, int((record_count + batch_size - 1) / batch_size))
+    dataset = dataset.repeat()
 
     model = build_model(num_classes=num_classes)
     optimizer = tf.keras.optimizers.SGD(learning_rate=lr, momentum=0.9, weight_decay=weight_decay)
@@ -284,7 +324,7 @@ def train_model(
         optimizer=optimizer,
     )
 
-    model.fit(dataset, epochs=epochs)
+    model.fit(dataset, epochs=epochs, steps_per_epoch=steps_per_epoch)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     model.save_weights(output_path)
@@ -295,6 +335,7 @@ def train_model(
         "num_classes": num_classes,
         "architecture": "retinanet",
         "bounding_box_format": "xyxy",
+        "image_size": self._args.image_size,
     }
     meta_path = output_path.with_suffix(".json")
     meta_path.write_text(json.dumps(metadata, indent=2))
@@ -350,6 +391,8 @@ class TrainingController:
 
     def _run_training(self, payload: Dict[str, Any]):
         try:
+            if self._args.image_size <= 0:
+                raise RuntimeError("--image-size must be > 0 for training")
             project_id = parse_project_id(payload, self._args.project_id)
             if project_id is None:
                 raise RuntimeError("Missing project_id for training")
@@ -377,6 +420,7 @@ class TrainingController:
                 batch_size=self._args.batch_size,
                 lr=self._args.lr,
                 weight_decay=self._args.weight_decay,
+                image_size=self._args.image_size,
             )
 
             metadata = load_metadata(output_path, None)
@@ -440,7 +484,13 @@ class BackendHandler(BaseHTTPRequestHandler):
                         self.server.label_studio_url,
                     )
                     model, class_names = self.server.model_store.with_model()
-                    results = predict(model, class_names, image_path, self.server.threshold)
+                    results = predict(
+                        model,
+                        class_names,
+                        image_path,
+                        self.server.threshold,
+                        self.server.image_size,
+                    )
                     for det in results:
                         detections.append(
                             {
@@ -502,6 +552,7 @@ class BackendServer(ThreadingHTTPServer):
         self.model_version = args.model_version
         self.label_studio_url = args.label_studio_url
         self.label_studio_token = args.label_studio_token
+        self.image_size = args.image_size
 
 
 def main():
@@ -512,6 +563,8 @@ def main():
     model_path = Path(args.model)
     metadata = load_metadata(model_path, Path(args.metadata) if args.metadata else None)
     num_classes = metadata.get("num_classes", len(metadata.get("class_names", [])) + 1)
+    if args.image_size <= 0 and metadata.get("image_size"):
+        args.image_size = int(metadata["image_size"])
 
     model = build_model(num_classes=num_classes)
     model.load_weights(model_path)

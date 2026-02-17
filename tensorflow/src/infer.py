@@ -4,6 +4,7 @@ import shutil
 from pathlib import Path
 from typing import Dict, List
 
+import numpy as np
 import tensorflow as tf
 from PIL import Image, ImageDraw
 
@@ -20,6 +21,7 @@ def parse_args():
     parser.add_argument("--output-dir", help="Optional directory to save annotated images")
     parser.add_argument("--copy-recognized", action="store_true", help="Copy recognized images into recognized/{high,medium,low,none}")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"])
+    parser.add_argument("--image-size", type=int, default=0, help="Resize images to a fixed square size (0 uses metadata or original size)")
     return parser.parse_args()
 
 
@@ -37,17 +39,36 @@ def list_images(images_dir: Path):
             yield path
 
 
-def decode_predictions(predictions, class_names: List[str], score_threshold: float):
+def _to_numpy(value):
+    if value is None:
+        return None
+    if hasattr(value, "numpy"):
+        return value.numpy()
+    if isinstance(value, np.ndarray):
+        return value
+    return np.array(value)
+
+
+def decode_predictions(predictions, class_names: List[str], score_threshold: float, scale_x: float, scale_y: float):
     if isinstance(predictions, dict):
         boxes = predictions.get("boxes")
         classes = predictions.get("classes")
-        scores = predictions.get("confidence") or predictions.get("scores")
+        scores = predictions.get("confidence")
+        if scores is None:
+            scores = predictions.get("scores")
     else:
         raise ValueError("Unexpected prediction format")
 
-    boxes = boxes.numpy()
-    classes = classes.numpy()
-    scores = scores.numpy()
+    boxes = _to_numpy(boxes)
+    classes = _to_numpy(classes)
+    scores = _to_numpy(scores)
+
+    if len(boxes.shape) == 3:
+        boxes = boxes[0]
+    if len(classes.shape) == 2:
+        classes = classes[0]
+    if len(scores.shape) == 2:
+        scores = scores[0]
 
     results = []
     for box, cls, score in zip(boxes, classes, scores):
@@ -58,7 +79,8 @@ def decode_predictions(predictions, class_names: List[str], score_threshold: flo
             label = str(label_index)
         else:
             label = class_names[label_index - 1]
-        results.append((label, float(score), [float(x) for x in box]))
+        x1, y1, x2, y2 = box
+        results.append((label, float(score), [float(x1 * scale_x), float(y1 * scale_y), float(x2 * scale_x), float(y2 * scale_y)]))
     results.sort(key=lambda item: item[1], reverse=True)
     return results
 
@@ -83,6 +105,9 @@ def main():
     metadata = load_metadata(model_path, Path(args.metadata) if args.metadata else None)
     class_names = metadata.get("class_names", [])
     num_classes = metadata.get("num_classes", len(class_names) + 1)
+    image_size = args.image_size
+    if image_size <= 0:
+        image_size = int(metadata.get("image_size", 0)) if metadata.get("image_size") else 0
 
     model = build_model(num_classes=num_classes)
     model.load_weights(model_path)
@@ -103,10 +128,21 @@ def main():
     for image_path in image_paths:
         print(f"Processing {image_path}")
         image_tensor = preprocess_image(load_image(image_path))
-        batch = tf.expand_dims(image_tensor, axis=0)
-        predictions = model.predict(batch, verbose=0)[0]
+        original_shape = tf.shape(image_tensor)
+        original_height = float(original_shape[0].numpy())
+        original_width = float(original_shape[1].numpy())
+        if image_size and image_size > 0:
+            resized = tf.image.resize(image_tensor, (image_size, image_size))
+            scale_x = original_width / float(image_size)
+            scale_y = original_height / float(image_size)
+            batch = tf.expand_dims(resized, axis=0)
+        else:
+            scale_x = 1.0
+            scale_y = 1.0
+            batch = tf.expand_dims(image_tensor, axis=0)
+        predictions = model.predict(batch, verbose=0)
 
-        results = decode_predictions(predictions, class_names, args.score_threshold)
+        results = decode_predictions(predictions, class_names, args.score_threshold, scale_x, scale_y)
         if results:
             top_results = results[:5]
             summary = ", ".join([f"{label} ({score:.2f})" for label, score, _ in top_results])

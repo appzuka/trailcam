@@ -122,6 +122,7 @@ def build_dataset(
     images_dir: Path,
     batch_size: int,
     shuffle: bool = True,
+    image_size: int | None = 640,
 ) -> Tuple[tf.data.Dataset, List[str], Dict[int, int], int]:
     records, class_names, cat_id_to_contig = build_records(coco_json, images_dir)
 
@@ -162,16 +163,34 @@ def build_dataset(
             target=TARGET_BOX_FORMAT,
             images=image,
         )
+        if image_size and image_size > 0:
+            original_shape = tf.shape(image)
+            original_height = tf.cast(original_shape[0], tf.float32)
+            original_width = tf.cast(original_shape[1], tf.float32)
+            image = tf.image.resize(image, (image_size, image_size))
+            scale_x = tf.cast(image_size, tf.float32) / original_width
+            scale_y = tf.cast(image_size, tf.float32) / original_height
+            scale = tf.stack([scale_x, scale_y, scale_x, scale_y])
+            boxes_xyxy = bounding_boxes["boxes"]
+            boxes_xyxy = tf.where(
+                tf.math.is_finite(boxes_xyxy),
+                boxes_xyxy,
+                tf.zeros_like(boxes_xyxy),
+            )
+            boxes_xyxy = boxes_xyxy * scale
+            bounding_boxes["boxes"] = boxes_xyxy
+            image = tf.ensure_shape(image, (image_size, image_size, 3))
         return {
             "images": image,
             "bounding_boxes": bounding_boxes,
         }
 
     ds = ds.map(load_example, num_parallel_calls=tf.data.AUTOTUNE)
+    image_shape = [image_size, image_size, 3] if image_size and image_size > 0 else [None, None, 3]
     ds = ds.padded_batch(
         batch_size,
         padded_shapes={
-            "images": [None, None, 3],
+            "images": image_shape,
             "bounding_boxes": {
                 "boxes": [None, 4],
                 "classes": [None],
@@ -184,6 +203,10 @@ def build_dataset(
                 "classes": tf.constant(-1, dtype=tf.int32),
             },
         },
+    )
+    ds = ds.map(
+        lambda sample: (sample["images"], sample["bounding_boxes"]),
+        num_parallel_calls=tf.data.AUTOTUNE,
     )
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds, class_names, cat_id_to_contig, len(records)

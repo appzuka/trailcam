@@ -104,9 +104,10 @@ python src/ls_backend.py \
   --model models/animals_frcnn.pth \
   --from-name label \
   --to-name image \
+  --to-name image \
   --label-studio-url http://localhost:8080 \
   --label-studio-token "$LS_TOKEN" \
-  --data-root /Volumes/2TB/Trailcam/labelling/images \
+  --data-root /Volumes/2TB/LabelStudio \
   --project-id 2
 ```
 

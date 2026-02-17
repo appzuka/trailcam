@@ -4,3 +4,7 @@
 /pytorch/.venv/
 /pytorch/models/
 /Models/
+/docker/mydata/
+/tensorflow/.venv/
+/docker/postgres-data/
+/tensorflow/models/

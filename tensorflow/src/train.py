@@ -18,6 +18,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=0.005)
     parser.add_argument("--weight-decay", type=float, default=0.0005)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "gpu"])
+    parser.add_argument("--image-size", type=int, default=640, help="Resize images to a fixed square size for training")
     return parser.parse_args()
 
 
@@ -25,6 +26,8 @@ def main():
     args = parse_args()
     device = resolve_device(args.device)
     print(f"Using device: {device}")
+    if args.image_size <= 0:
+        raise ValueError("--image-size must be > 0 for training")
 
     coco_json = Path(args.coco_json)
     images_dir = Path(args.images_dir)
@@ -33,9 +36,12 @@ def main():
         images_dir,
         batch_size=args.batch_size,
         shuffle=True,
+        image_size=args.image_size,
     )
     num_classes = len(class_names) + 1
     print(f"Dataset images: {record_count} | classes: {len(class_names)}")
+    steps_per_epoch = max(1, int((record_count + args.batch_size - 1) / args.batch_size))
+    dataset = dataset.repeat()
 
     model = build_model(num_classes=num_classes)
     optimizer = tf.keras.optimizers.SGD(learning_rate=args.lr, momentum=0.9, weight_decay=args.weight_decay)
@@ -45,7 +51,7 @@ def main():
         optimizer=optimizer,
     )
 
-    model.fit(dataset, epochs=args.epochs)
+    model.fit(dataset, epochs=args.epochs, steps_per_epoch=steps_per_epoch)
 
     output_path = Path(args.output)
     if output_path.suffix != ".h5" and not output_path.name.endswith(".weights.h5"):
@@ -59,6 +65,7 @@ def main():
         "num_classes": num_classes,
         "architecture": "retinanet",
         "bounding_box_format": "xyxy",
+        "image_size": args.image_size,
     }
     meta_path = output_path.with_suffix(".json")
     meta_path.write_text(json.dumps(metadata, indent=2))
