@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from torchvision.transforms import functional as F
 
 from utils import build_model, resolve_device
@@ -22,7 +22,11 @@ def parse_args():
     parser.add_argument("--max-dim", type=int, default=None, help="Downscale images so the longest side is <= this value (0 disables)")
     parser.add_argument("--min-size", type=int, default=None, help="Model transform min size (default varies by arch/device)")
     parser.add_argument("--max-size", type=int, default=None, help="Model transform max size (default varies by arch/device)")
-    parser.add_argument("--copy-recognized", action="store_true", help="Copy recognized images into recognized/{high,medium,low}")
+    parser.add_argument(
+        "--box",
+        action="store_true",
+        help="Copy images into detected/empty subfolders and draw class-colored boxes on detections",
+    )
     return parser.parse_args()
 
 
@@ -73,17 +77,90 @@ def list_images(images_dir: Path):
             yield path
 
 
-def draw_detections(image: Image.Image, detections, class_names, score_threshold: float):
+COLOR_BY_LABEL = {
+    "badger": (255, 165, 0),
+    "fox": (255, 0, 0),
+    "mouse": (255, 255, 0),
+    "bird": (0, 200, 0),
+    "squirrel": (0, 0, 255),
+}
+
+
+def color_for_label(label: str):
+    return COLOR_BY_LABEL.get(label.strip().lower(), (255, 255, 255))
+
+
+def draw_detections(image: Image.Image, results):
     draw = ImageDraw.Draw(image)
-    for box, label, score in zip(detections["boxes"], detections["labels"], detections["scores"]):
-        if score < score_threshold:
-            continue
-        x1, y1, x2, y2 = box.tolist()
-        name = class_names[label - 1] if 0 < label <= len(class_names) else str(int(label))
-        text = f"{name} {score:.2f}"
-        draw.rectangle([x1, y1, x2, y2], outline="red", width=2)
-        draw.text((x1, y1), text, fill="red")
+    for name, score, box in results:
+        x1, y1, x2, y2 = box
+        color = color_for_label(name)
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
     return image
+
+
+def draw_summary(image: Image.Image, results):
+    if not results:
+        return image
+    draw = ImageDraw.Draw(image)
+    lines = [(name, score) for name, score, _ in results]
+    font = None
+    try:
+        font = ImageFont.load_default(size=36)
+    except TypeError:
+        font = ImageFont.load_default()
+
+    def measure(text: str):
+        try:
+            bbox = draw.textbbox((0, 0), text, font=font)
+            return bbox[2] - bbox[0], bbox[3] - bbox[1]
+        except AttributeError:
+            return draw.textsize(text, font=font)
+
+    text_w_sample, text_h_sample = measure("Ag")
+    circle_d = max(1, int(text_h_sample))
+    padding = 4
+    gap = 6
+    line_spacing = 4
+
+    line_metrics = []
+    max_line_w = 0
+    for name, score in lines:
+        text = f"{name} [{score:.2f}]"
+        text_w, text_h = measure(text)
+        line_h = max(text_h, circle_d)
+        line_w = circle_d + gap + text_w
+        max_line_w = max(max_line_w, line_w)
+        line_metrics.append((text, text_w, text_h, line_h))
+
+    total_h = sum(m[3] for m in line_metrics)
+    if len(line_metrics) > 1:
+        total_h += line_spacing * (len(line_metrics) - 1)
+    box_w = max_line_w + padding * 2
+    box_h = total_h + padding * 2
+    draw.rectangle([0, 0, box_w, box_h], fill=(0, 0, 0))
+    y = padding
+    for (name, _), (text, text_w, text_h, line_h) in zip(lines, line_metrics):
+        color = color_for_label(name)
+        circle_x = padding
+        circle_y = y + (line_h - circle_d) / 2
+        draw.ellipse(
+            [circle_x, circle_y, circle_x + circle_d, circle_y + circle_d],
+            fill=color,
+            outline=color,
+        )
+        text_x = circle_x + circle_d + gap
+        text_y = y + (line_h - text_h) / 2
+        draw.text((text_x, text_y), text, fill=(255, 255, 255), font=font)
+        y += line_h + line_spacing
+    return image
+
+
+def annotate_image(image: Image.Image, results):
+    annotated = image.copy()
+    draw_detections(annotated, results)
+    draw_summary(annotated, results)
+    return annotated
 
 
 def resize_for_inference(image: Image.Image, max_dim: int):
@@ -215,32 +292,25 @@ def main():
         else:
             print("Top 5: no detections")
 
-        if args.copy_recognized:
-            recognized_root = image_path.parent / "recognized"
-            dest_dir = None
-            dest_name = image_path.name
-            if results:
-                top_label, top_score, _ = results[0]
-                safe_label = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in top_label).strip("_")
-                if safe_label:
-                    dest_name = f"{safe_label}_{image_path.name}"
-                if top_score >= 0.9:
-                    dest_dir = recognized_root / "high"
-                elif top_score >= 0.6:
-                    dest_dir = recognized_root / "medium"
-                elif top_score >= 0.3:
-                    dest_dir = recognized_root / "low"
-            else:
-                dest_dir = recognized_root / "none"
-
-            if dest_dir is not None:
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                dest_path = dest_dir / dest_name
-                if not dest_path.exists():
+        annotated = None
+        if args.box:
+            dest_root = Path(args.images_dir) if args.images_dir else image_path.parent
+            dest_dir = dest_root / ("detected" if results else "empty")
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_path = dest_dir / image_path.name
+            if not dest_path.exists():
+                if results:
+                    annotated = annotate_image(image, results)
+                    annotated.save(dest_path)
+                else:
                     shutil.copy2(image_path, dest_path)
 
         if output_dir:
-            annotated = draw_detections(image, detections, class_names, args.score_threshold)
+            if results:
+                if annotated is None:
+                    annotated = annotate_image(image, results)
+            else:
+                annotated = image
             out_path = output_dir / image_path.name
             annotated.save(out_path)
 

@@ -47,7 +47,7 @@ services:
     #      - LOG_LEVEL=DEBUG
     volumes:
       - ./mydata:/label-studio/data:rw
-      - /Volumes/2TB/LabelStudio/trailcam/images:/data/local-files/images/trailcam
+      - ~/2TB/LabelStudio/images/trailcam:/data/local-files/images/trailcam
     command: label-studio-uwsgi
 
   db:

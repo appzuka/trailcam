@@ -72,12 +72,12 @@ python src/infer.py \
   --score-threshold 0.4 \
   --max-dim 1024
 ```
-To copy recognized images into `recognized/high`, `recognized/medium`, and `recognized/low` based on top confidence:
+To copy images into `detected/` or `empty/` and draw class-colored boxes:
 ```
 python src/infer.py \
   --model models/animals_frcnn.pth \
   --images-dir ./images \
-  --copy-recognized
+  --box
 ```
 
 ## Code overview
@@ -107,7 +107,7 @@ python src/ls_backend.py \
   --to-name image \
   --label-studio-url http://localhost:8080 \
   --label-studio-token "$LS_TOKEN" \
-  --data-root /Volumes/2TB/LabelStudio \
+  --data-root ~/2TB \
   --project-id 2
 ```
 
@@ -118,3 +118,7 @@ Label Studio connection:
 Training:
 - Hitting `/train` or `/webhook` on the backend triggers a fresh COCO export from Label Studio and trains a new Faster R-CNN checkpoint on CPU at full resolution.
 - The backend updates the in-memory model after training completes.
+
+Notes:
+- `--data-root` should point at the host path that contains `images/...` (for example `~/2TB`).
+- You can also set `LS_DATA_ROOT=~/2TB` or `LS_DATA_ROOTS=/path/one:/path/two` to avoid repeating flags.

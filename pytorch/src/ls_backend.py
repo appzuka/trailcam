@@ -29,7 +29,10 @@ def parse_args():
     parser.add_argument("--from-name", required=True, help="Label Studio from_name")
     parser.add_argument("--to-name", required=True, help="Label Studio to_name")
     parser.add_argument("--data-key", default="image", help="Task data key for image URL")
-    parser.add_argument("--data-root", help="Root directory for local-files")
+    parser.add_argument(
+        "--data-root",
+        help="Root directory for local-files (supports colon-separated list or LS_DATA_ROOT(S))",
+    )
     parser.add_argument("--label-studio-url", help="Base Label Studio URL")
     parser.add_argument("--label-studio-token", help="Label Studio token (defaults to LS_TOKEN)")
     parser.add_argument("--project-id", type=int, help="Default project ID for /train")
@@ -43,6 +46,68 @@ def parse_args():
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--images-root", help="Override images root when training")
     return parser.parse_args()
+
+
+def _expand_paths(value: Optional[str]) -> list[Path]:
+    if not value:
+        return []
+    parts = [part for part in value.split(os.pathsep) if part]
+    return [Path(os.path.expandvars(os.path.expanduser(part))) for part in parts]
+
+
+def collect_data_roots(arg_value: Optional[str]) -> list[Path]:
+    roots = _expand_paths(arg_value)
+    env_value = os.environ.get("LS_DATA_ROOTS") or os.environ.get("LS_DATA_ROOT")
+    roots.extend(_expand_paths(env_value))
+    seen = set()
+    unique: list[Path] = []
+    for root in roots:
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(root)
+    return unique
+
+
+def choose_images_root(data_roots: list[Path]) -> Optional[Path]:
+    for root in data_roots:
+        if root.name == "images" and root.exists():
+            return root
+    for root in data_roots:
+        candidate = root / "images"
+        if candidate.exists():
+            return candidate
+    for root in data_roots:
+        if root.exists():
+            return root
+    return None
+
+
+def should_train_from_webhook(payload: Dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return True
+
+    def value_contains(keys: tuple[str, ...], needle: str) -> bool:
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, str) and needle in value.upper():
+                return True
+        return False
+
+    if value_contains(("event", "action", "type", "status"), "TRAIN"):
+        return True
+    if value_contains(("event", "action", "type", "status"), "ANNOTATION"):
+        return False
+    if value_contains(("event", "action", "type", "status"), "TASK"):
+        return False
+    if value_contains(("event", "action", "type", "status"), "COMMENT"):
+        return False
+
+    if any(key in payload for key in ("annotation", "annotations", "task", "task_id", "comment")):
+        return False
+
+    return True
 
 
 def resolve_token(token: Optional[str]) -> Optional[str]:
@@ -165,7 +230,13 @@ def locate_result_json(export_dir: Path) -> Path:
     raise RuntimeError("No JSON found in export")
 
 
-def resolve_image_value(value: Any, data_root: Optional[Path], allow_absolute: bool, token: Optional[str], base_url: Optional[str]) -> Path:
+def resolve_image_value(
+    value: Any,
+    data_roots: list[Path],
+    allow_absolute: bool,
+    token: Optional[str],
+    base_url: Optional[str],
+) -> Path:
     if not isinstance(value, str):
         raise RuntimeError("Image value is not a string")
 
@@ -199,15 +270,23 @@ def resolve_image_value(value: Any, data_root: Optional[Path], allow_absolute: b
     if decoded.startswith("local-files/"):
         decoded = decoded[len("local-files/") :]
 
+    def resolve_from_roots(relative: str) -> Path:
+        if not data_roots:
+            return Path(relative)
+        for root in data_roots:
+            candidate = root / relative
+            if candidate.exists():
+                return candidate
+        return data_roots[0] / relative
+
     if decoded.startswith("/"):
         if allow_absolute:
             return Path(decoded)
-        if data_root:
-            return data_root / decoded.lstrip("/")
+        if data_roots:
+            return resolve_from_roots(decoded.lstrip("/"))
+        return Path(decoded)
 
-    if data_root:
-        return data_root / decoded
-    return Path(decoded)
+    return resolve_from_roots(decoded)
 
 
 def set_full_resolution(model):
@@ -412,9 +491,12 @@ class TrainingController:
             if self._args.images_root:
                 images_dir = Path(self._args.images_root)
             else:
-                candidate = export_dir / "images"
-                if candidate.exists():
-                    images_dir = candidate
+                data_roots = collect_data_roots(self._args.data_root)
+                images_dir = choose_images_root(data_roots)
+                if images_dir is None:
+                    candidate = export_dir / "images"
+                    if candidate.exists():
+                        images_dir = candidate
             if images_dir is None:
                 raise RuntimeError("Images directory not found; set --images-root")
 
@@ -462,7 +544,12 @@ class BackendHandler(BaseHTTPRequestHandler):
             return
 
         if self.path.rstrip("/") == "/webhook":
-            self._send_json({"status": "ok"})
+            payload = self._parse_json(body)
+            if should_train_from_webhook(payload):
+                message = self.server.training.start(payload)
+                self._send_json({"status": message})
+            else:
+                self._send_json({"status": "ignored"})
             return
 
         if self.path.rstrip("/") == "/predict":
@@ -486,7 +573,7 @@ class BackendHandler(BaseHTTPRequestHandler):
                 try:
                     image_path = resolve_image_value(
                         image_value,
-                        self.server.data_root,
+                        self.server.data_roots,
                         self.server.allow_absolute,
                         self.server.label_studio_token,
                         self.server.label_studio_url,
@@ -549,7 +636,7 @@ class BackendServer(ThreadingHTTPServer):
         self.from_name = args.from_name
         self.to_name = args.to_name
         self.data_key = args.data_key
-        self.data_root = Path(args.data_root).expanduser() if args.data_root else None
+        self.data_roots = collect_data_roots(args.data_root)
         self.allow_absolute = args.allow_absolute
         self.model_version = args.model_version
         self.label_studio_url = args.label_studio_url

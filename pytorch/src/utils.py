@@ -1,8 +1,9 @@
 import json
 import random
+import re
 import urllib.parse
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from PIL import Image
@@ -117,6 +118,7 @@ class COCODataset(Dataset):
         self.images_dir = images_dir
         self.image_ids = sorted(self.images.keys())
         self.transforms = get_transform(train, max_dim)
+        self._basename_index: Optional[Dict[str, Path]] = None
 
     def __len__(self) -> int:
         return len(self.image_ids)
@@ -129,7 +131,25 @@ class COCODataset(Dataset):
         fallback = self.images_dir / Path(normalized).name
         if fallback.exists():
             return fallback
+        if self._basename_index is None:
+            self._basename_index = self._build_basename_index()
+        basename = Path(normalized).name
+        mapped = self._basename_index.get(basename)
+        if mapped is not None:
+            return mapped
         return candidate
+
+    def _build_basename_index(self) -> Dict[str, Path]:
+        index: Dict[str, Path] = {}
+        if not self.images_dir.exists():
+            return index
+        for path in self.images_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            name = path.name
+            if name not in index:
+                index[name] = path
+        return index
 
     def _normalize_file_name(self, file_name: str) -> str:
         decoded = urllib.parse.unquote(file_name).replace("\\", "/")
@@ -161,6 +181,11 @@ class COCODataset(Dataset):
             decoded = decoded[len("local-files/") :]
         while decoded.startswith("images/"):
             decoded = decoded[len("images/") :]
+
+        parts = decoded.split("/")
+        if parts:
+            parts[-1] = re.sub(r"^[a-f0-9]{8,64}__", "", parts[-1], flags=re.IGNORECASE)
+            decoded = "/".join(parts)
 
         return decoded
 

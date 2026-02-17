@@ -133,3 +133,6 @@ This mode uses Vision image classification to detect a small set of animals and 
 ## Notes
 - Requires macOS 14+ due to Vision image classification usage.
 - The canonical CLI usage text is embedded in `Sources/Recognize/Recognize.swift` as `usageText`.
+
+## ToDo
+- Add a train/validation split (and basic metrics reporting) to the PyTorch training pipeline.
