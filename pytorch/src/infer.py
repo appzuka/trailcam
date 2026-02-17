@@ -218,6 +218,35 @@ def run_inference(model, class_names, image_path: Path, device: torch.device, sc
     return original, detections, results
 
 
+def reduce_results_by_label(results: List[Tuple[str, float, List[float]]]):
+    label_boxes: Dict[str, List[float]] = {}
+    label_scores: Dict[str, float] = {}
+    for name, score, box in results:
+        if score > label_scores.get(name, -1.0):
+            label_scores[name] = score
+            label_boxes[name] = box
+    return label_boxes, label_scores
+
+
+def interpolate_boxes(
+    prev_boxes: Dict[str, List[float]],
+    next_boxes: Dict[str, List[float]],
+    t: float,
+) -> Dict[str, List[float]]:
+    labels = set(prev_boxes.keys()) | set(next_boxes.keys())
+    blended: Dict[str, List[float]] = {}
+    for label in labels:
+        box_a = prev_boxes.get(label)
+        box_b = next_boxes.get(label)
+        if box_a is not None and box_b is not None:
+            blended[label] = [a + (b - a) * t for a, b in zip(box_a, box_b)]
+        elif box_a is not None:
+            blended[label] = box_a
+        elif box_b is not None:
+            blended[label] = box_b
+    return blended
+
+
 def process_video(
     video_path: Path,
     model,
@@ -244,19 +273,24 @@ def process_video(
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     if fps <= 0:
         fps = 30.0
+    step = max(1, int(round(fps)))
+    keyframes: Dict[int, Dict[str, List[float]]] = {}
     while True:
         ok, frame = cap.read()
         if not ok:
             break
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil = Image.fromarray(rgb)
-        _, results = run_inference_on_image(model, class_names, pil, device, score_threshold, max_dim)
-        if results:
-            has_any = True
-            last_detected_frame = frame_idx
-            for name, score, _ in results:
-                if score > max_scores.get(name, 0.0):
-                    max_scores[name] = score
+        if frame_idx % step == 0:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil = Image.fromarray(rgb)
+            _, results = run_inference_on_image(model, class_names, pil, device, score_threshold, max_dim)
+            label_boxes, label_scores = reduce_results_by_label(results)
+            keyframes[frame_idx] = label_boxes
+            if label_boxes:
+                has_any = True
+                last_detected_frame = frame_idx
+                for name, score in label_scores.items():
+                    if score > max_scores.get(name, 0.0):
+                        max_scores[name] = score
         frame_idx += 1
     cap.release()
 
@@ -286,6 +320,9 @@ def process_video(
         total_seconds = (last_frame_to_write + 1) / fps if last_frame_to_write >= 0 else 0.0
         last_printed_second = -1
         frame_idx = 0
+        key_indices = sorted(keyframes.keys())
+        next_pos = 0
+        prev_idx = None
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -294,9 +331,36 @@ def process_video(
                 break
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             pil = Image.fromarray(rgb)
-            _, results = run_inference_on_image(model, class_names, pil, device, score_threshold, max_dim)
             annotated = pil.copy()
-            if results:
+            while next_pos < len(key_indices) and key_indices[next_pos] < frame_idx:
+                prev_idx = key_indices[next_pos]
+                next_pos += 1
+            next_idx = key_indices[next_pos] if next_pos < len(key_indices) else None
+            if next_idx is not None and frame_idx == next_idx:
+                interpolated = keyframes.get(next_idx, {})
+            elif prev_idx is None and next_idx is None:
+                interpolated = {}
+            elif prev_idx is None:
+                interpolated = {}
+            elif next_idx is None:
+                interpolated = keyframes.get(prev_idx, {})
+            elif prev_idx == next_idx:
+                interpolated = keyframes.get(prev_idx, {})
+            else:
+                prev_boxes = keyframes.get(prev_idx, {})
+                next_boxes = keyframes.get(next_idx, {})
+                if not prev_boxes and not next_boxes:
+                    interpolated = {}
+                elif not prev_boxes and next_boxes:
+                    interpolated = {}
+                elif prev_boxes and not next_boxes:
+                    interpolated = prev_boxes
+                else:
+                    t = (frame_idx - prev_idx) / float(next_idx - prev_idx)
+                    interpolated = interpolate_boxes(prev_boxes, next_boxes, t)
+
+            if interpolated:
+                results = [(label, 1.0, box) for label, box in interpolated.items()]
                 draw_detections(annotated, results)
             if summary_lines:
                 draw_summary_lines(annotated, summary_lines)
