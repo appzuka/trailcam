@@ -1,9 +1,11 @@
 import argparse
 import shutil
+import sys
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 from torchvision.transforms import functional as F
 
@@ -73,7 +75,8 @@ def load_checkpoint(
 
 def list_images(images_dir: Path):
     for path in sorted(images_dir.iterdir()):
-        if path.suffix.lower() in {".jpg", ".jpeg", ".png"}:
+        suffix = path.suffix.lower()
+        if suffix in {".jpg", ".jpeg", ".png", ".mov", ".mp4", ".avi"}:
             yield path
 
 
@@ -99,16 +102,18 @@ def draw_detections(image: Image.Image, results):
     return image
 
 
-def draw_summary(image: Image.Image, results):
-    if not results:
+def draw_summary_lines(image: Image.Image, lines: List[Tuple[str, float]]):
+    if not lines:
         return image
     draw = ImageDraw.Draw(image)
-    lines = [(name, score) for name, score, _ in results]
     font = None
     try:
-        font = ImageFont.load_default(size=36)
-    except TypeError:
-        font = ImageFont.load_default()
+        font = ImageFont.truetype("DejaVuSans.ttf", 36)
+    except Exception:
+        try:
+            font = ImageFont.load_default(size=36)
+        except TypeError:
+            font = ImageFont.load_default()
 
     def measure(text: str):
         try:
@@ -156,6 +161,11 @@ def draw_summary(image: Image.Image, results):
     return image
 
 
+def draw_summary(image: Image.Image, results):
+    lines = [(name, score) for name, score, _ in results]
+    return draw_summary_lines(image, lines)
+
+
 def annotate_image(image: Image.Image, results):
     annotated = image.copy()
     draw_detections(annotated, results)
@@ -177,9 +187,8 @@ def resize_for_inference(image: Image.Image, max_dim: int):
     return resized, scale
 
 
-def run_inference(model, class_names, image_path: Path, device: torch.device, score_threshold: float, max_dim: int):
-    original = Image.open(image_path).convert("RGB")
-    resized, scale = resize_for_inference(original, max_dim)
+def run_inference_on_image(model, class_names, image: Image.Image, device: torch.device, score_threshold: float, max_dim: int):
+    resized, scale = resize_for_inference(image, max_dim)
     tensor = F.to_tensor(resized).to(device)
     with torch.no_grad():
         output = model([tensor])[0]
@@ -200,7 +209,115 @@ def run_inference(model, class_names, image_path: Path, device: torch.device, sc
         name = class_names[label - 1] if 0 < label <= len(class_names) else str(int(label))
         results.append((name, float(score), [float(x) for x in box.tolist()]))
 
+    return detections, results
+
+
+def run_inference(model, class_names, image_path: Path, device: torch.device, score_threshold: float, max_dim: int):
+    original = Image.open(image_path).convert("RGB")
+    detections, results = run_inference_on_image(model, class_names, original, device, score_threshold, max_dim)
     return original, detections, results
+
+
+def process_video(
+    video_path: Path,
+    model,
+    class_names,
+    device: torch.device,
+    score_threshold: float,
+    max_dim: int,
+    dest_root: Path,
+):
+    try:
+        import cv2
+    except Exception as exc:
+        raise SystemExit(f"opencv-python is required for video processing: {exc}")
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Unable to open video: {video_path}")
+
+    max_scores: Dict[str, float] = {}
+    has_any = False
+    last_detected_frame = -1
+    frame_idx = 0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    if fps <= 0:
+        fps = 30.0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        _, results = run_inference_on_image(model, class_names, pil, device, score_threshold, max_dim)
+        if results:
+            has_any = True
+            last_detected_frame = frame_idx
+            for name, score, _ in results:
+                if score > max_scores.get(name, 0.0):
+                    max_scores[name] = score
+        frame_idx += 1
+    cap.release()
+
+    if total_frames <= 0:
+        total_frames = frame_idx
+
+    summary_lines = sorted(max_scores.items(), key=lambda item: item[1], reverse=True)
+
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Unable to open video: {video_path}")
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    dest_dir = dest_root / ("detected" if has_any else "empty")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / f"{video_path.stem}.mp4"
+    writer = cv2.VideoWriter(str(dest_path), fourcc, fps, (width, height))
+
+    try:
+        if has_any:
+            trim_frames = int(round(2 * fps))
+            last_frame_to_write = min(last_detected_frame + trim_frames, total_frames - 1)
+        else:
+            last_frame_to_write = total_frames - 1
+        total_seconds = (last_frame_to_write + 1) / fps if last_frame_to_write >= 0 else 0.0
+        last_printed_second = -1
+        frame_idx = 0
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if frame_idx > last_frame_to_write:
+                break
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil = Image.fromarray(rgb)
+            _, results = run_inference_on_image(model, class_names, pil, device, score_threshold, max_dim)
+            annotated = pil.copy()
+            if results:
+                draw_detections(annotated, results)
+            if summary_lines:
+                draw_summary_lines(annotated, summary_lines)
+            bgr = cv2.cvtColor(np.array(annotated), cv2.COLOR_RGB2BGR)
+            writer.write(bgr)
+            frame_idx += 1
+
+            if fps > 0:
+                current_second = int(frame_idx / fps)
+                if current_second != last_printed_second:
+                    remaining = max(0.0, total_seconds - (frame_idx / fps))
+                    sys.stdout.write(
+                        f"\r{video_path.name}: {frame_idx / fps:.1f}s processed, {remaining:.1f}s remaining"
+                    )
+                    sys.stdout.flush()
+                    last_printed_second = current_second
+    finally:
+        cap.release()
+        writer.release()
+        if fps > 0:
+            sys.stdout.write("\n")
 
 
 def main():
@@ -263,6 +380,22 @@ def main():
 
     for image_path in image_paths:
         print(f"Processing {image_path}")
+        suffix = image_path.suffix.lower()
+        if suffix in {".mov", ".mp4", ".avi"}:
+            if not args.box:
+                print("Skipping video (use --box to process videos).")
+                continue
+            dest_root = Path(args.images_dir) if args.images_dir else image_path.parent
+            process_video(
+                image_path,
+                model,
+                class_names,
+                device,
+                args.score_threshold,
+                max_dim,
+                dest_root,
+            )
+            continue
         try:
             image, detections, results = run_inference(
                 model,
