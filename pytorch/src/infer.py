@@ -35,6 +35,11 @@ def parse_args():
         action="store_true",
         help="Copy images into detected/empty subfolders and draw class-colored boxes on detections",
     )
+    parser.add_argument(
+        "--classify",
+        action="store_true",
+        help="Copy images into subfolders named by the count of unique labels detected (0, 1, 2, etc.)",
+    )
     return parser.parse_args()
 
 
@@ -127,6 +132,9 @@ def run_yolo_inference(model, image_path: Path, score_threshold: float, imgsz: i
 
 def list_images(images_dir: Path):
     for path in sorted(images_dir.iterdir()):
+        # Skip hidden files (starting with '.')
+        if path.name.startswith('.'):
+            continue
         suffix = path.suffix.lower()
         if suffix in {".jpg", ".jpeg", ".png", ".mov", ".mp4", ".avi"}:
             yield path
@@ -575,6 +583,17 @@ def main():
                     annotated.save(dest_path)
                 else:
                     shutil.copy2(image_path, dest_path)
+
+        if args.classify:
+            dest_root = Path(args.images_dir) if args.images_dir else image_path.parent
+            # Count unique labels detected
+            unique_labels = set(name for name, _, _ in results)
+            label_count = len(unique_labels)
+            dest_dir = dest_root / str(label_count)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_path = dest_dir / image_path.name
+            if not dest_path.exists():
+                shutil.copy2(image_path, dest_path)
 
         if output_dir:
             if results:

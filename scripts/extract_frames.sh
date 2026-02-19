@@ -16,6 +16,7 @@ Options:
   --fps <fps>            Extract at N frames per second (overrides --interval)
   --max-frames <count>   Cap frames per video (default: 0 = no cap)
   --ext <ext>            Output image extension: jpg or png (default: jpg)
+  --crop                 Crop lower 85 pixels (1920x1080 -> 1920x995)
   -h, --help             Show this help
 
 Examples:
@@ -35,6 +36,7 @@ interval="2.0"
 fps=""
 max_frames="0"
 ext="jpg"
+crop="false"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -53,6 +55,9 @@ while [[ $# -gt 0 ]]; do
     --ext)
       shift
       ext="${1:-}"
+      ;;
+    --crop)
+      crop="true"
       ;;
     -h|--help)
       usage
@@ -77,7 +82,7 @@ if [[ "$ext" != "jpg" && "$ext" != "png" ]]; then
   exit 1
 fi
 
-ingest_dir="$base_dir/ingest"
+ingest_dir="$base_dir"
 images_dir="$base_dir/images"
 done_dir="$base_dir/done"
 
@@ -95,11 +100,12 @@ collect_files() {
   find "$ingest_dir" -maxdepth 1 -type f \( -iname "*.mp4" -o -iname "*.mov" \) -print0
 }
 
+# Collect all files into an array first to avoid stdin corruption
+mapfile -t -d '' files < <(collect_files)
+
 found_any="false"
-while IFS= read -r -d '' file; do
+for file in "${files[@]}"; do
   [[ -z "$file" ]] && continue
-  base=$(basename "$file")
-  file="$ingest_dir/$base"
   if [[ ! -f "$file" ]]; then
     echo "Skipping missing file: $file" >&2
     continue
@@ -115,16 +121,21 @@ while IFS= read -r -d '' file; do
     filter="fps=1/${interval}"
   fi
 
+  # Add crop filter if requested (crop bottom 85 pixels: 1920x1080 -> 1920x995)
+  if [[ "$crop" == "true" ]]; then
+    filter="${filter},crop=1920:995:0:0"
+  fi
+
   output_pattern="$images_dir/${name}-%06d.${ext}"
 
   if [[ "$max_frames" != "0" ]]; then
-    ffmpeg -hide_banner -loglevel error -i "$file" -vf "$filter" -frames:v "$max_frames" "$output_pattern"
+    ffmpeg -hide_banner -loglevel error -i "$file" -vf "$filter" -frames:v "$max_frames" "$output_pattern" 2>&1
   else
-    ffmpeg -hide_banner -loglevel error -i "$file" -vf "$filter" "$output_pattern"
+    ffmpeg -hide_banner -loglevel error -i "$file" -vf "$filter" "$output_pattern" 2>&1
   fi
 
   mv "$file" "$done_dir/"
-done < <(collect_files)
+done
 
 if [[ "$found_any" != "true" ]]; then
   echo "No video files found in $ingest_dir" >&2
