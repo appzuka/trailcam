@@ -1,6 +1,8 @@
 import json
+import os
 import random
 import re
+import shutil
 import urllib.parse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -236,6 +238,110 @@ class COCODataset(Dataset):
 
         image, target = self.transforms(image, target)
         return image, target
+
+
+def _link_or_copy(src: Path, dest: Path):
+    if dest.exists():
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.symlink(src, dest)
+    except OSError:
+        shutil.copy2(src, dest)
+
+
+def export_yolo_dataset(
+    coco_json: Path,
+    images_dir: Path,
+    output_dir: Path,
+    val_split: float,
+    seed: int,
+) -> Tuple[Path, List[str]]:
+    output_dir = output_dir.resolve()
+    images, anns_by_image, cat_id_to_contig, class_names = load_coco(coco_json)
+    dataset = COCODataset(coco_json, images_dir, train=True, max_dim=0)
+    image_ids = sorted(images.keys())
+
+    if val_split > 0:
+        rng = random.Random(seed)
+        rng.shuffle(image_ids)
+        split_idx = int(len(image_ids) * (1 - val_split))
+        train_ids = image_ids[:split_idx]
+        val_ids = image_ids[split_idx:]
+    else:
+        train_ids = image_ids
+        val_ids = []
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    train_images_dir = output_dir / "images" / "train"
+    val_images_dir = output_dir / "images" / "val"
+    train_labels_dir = output_dir / "labels" / "train"
+    val_labels_dir = output_dir / "labels" / "val"
+
+    def resolve_size(info: dict, image_path: Path) -> Tuple[int, int]:
+        width = info.get("width")
+        height = info.get("height")
+        if width and height:
+            return int(width), int(height)
+        with Image.open(image_path) as img:
+            return img.size
+
+    def write_split(ids: List[int], split_images: Path, split_labels: Path):
+        split_images.mkdir(parents=True, exist_ok=True)
+        split_labels.mkdir(parents=True, exist_ok=True)
+        for image_id in ids:
+            info = images[image_id]
+            image_path = dataset._resolve_image_path(info["file_name"])
+            suffix = image_path.suffix if image_path.suffix else ".jpg"
+            dest_image = split_images / f"{image_id}{suffix}"
+            _link_or_copy(image_path, dest_image)
+
+            width, height = resolve_size(info, image_path)
+            anns = anns_by_image.get(image_id, [])
+            lines = []
+            for ann in anns:
+                if ann.get("iscrowd"):
+                    continue
+                bbox = ann.get("bbox")
+                if not bbox or len(bbox) != 4:
+                    continue
+                x, y, w, h = bbox
+                if w <= 0 or h <= 0:
+                    continue
+                class_idx = cat_id_to_contig.get(ann["category_id"])
+                if class_idx is None:
+                    continue
+                class_idx -= 1
+                x_center = (x + w / 2.0) / width
+                y_center = (y + h / 2.0) / height
+                w_norm = w / width
+                h_norm = h / height
+                x_center = min(max(x_center, 0.0), 1.0)
+                y_center = min(max(y_center, 0.0), 1.0)
+                w_norm = min(max(w_norm, 0.0), 1.0)
+                h_norm = min(max(h_norm, 0.0), 1.0)
+                lines.append(f"{class_idx} {x_center:.6f} {y_center:.6f} {w_norm:.6f} {h_norm:.6f}")
+
+            label_path = split_labels / f"{image_id}.txt"
+            label_path.write_text("\n".join(lines), encoding="utf-8")
+
+    write_split(train_ids, train_images_dir, train_labels_dir)
+    if val_ids:
+        write_split(val_ids, val_images_dir, val_labels_dir)
+
+    data_yaml = output_dir / "data.yaml"
+    val_path = "images/val" if val_ids else "images/train"
+    lines = [
+        f"path: {output_dir}",
+        "train: images/train",
+        f"val: {val_path}",
+        f"nc: {len(class_names)}",
+        "names:",
+    ]
+    for idx, name in enumerate(class_names):
+        lines.append(f"  {idx}: {name}")
+    data_yaml.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return data_yaml, class_names
 
 
 def build_model(

@@ -8,3 +8,4 @@
 /tensorflow/.venv/
 /docker/postgres-data/
 /tensorflow/models/
+/runs/

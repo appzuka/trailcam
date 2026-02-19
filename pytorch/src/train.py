@@ -1,11 +1,12 @@
 import argparse
+import shutil
 import time
 from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from utils import COCODataset, build_model, resolve_device
+from utils import COCODataset, build_model, export_yolo_dataset, resolve_device
 
 
 def collate_fn(batch):
@@ -13,7 +14,7 @@ def collate_fn(batch):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train a Faster R-CNN model on COCO-format data.")
+    parser = argparse.ArgumentParser(description="Train a detection model on COCO-format data.")
     parser.add_argument("--coco-json", required=True, help="Path to COCO result.json / annotations.json")
     parser.add_argument("--images-dir", required=True, help="Path to images directory")
     parser.add_argument("--output", required=True, help="Output checkpoint path (.pth)")
@@ -27,10 +28,17 @@ def parse_args():
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
     parser.add_argument("--no-pretrained", action="store_true", help="Disable COCO pretrained weights")
     parser.add_argument("--log-every", type=int, default=10, help="Log progress every N batches")
-    parser.add_argument("--arch", choices=["fasterrcnn", "ssdlite"], default=None, help="Model architecture (default: fasterrcnn, or ssdlite on MPS)")
+    parser.add_argument(
+        "--arch",
+        choices=["fasterrcnn", "ssdlite", "yolo"],
+        default=None,
+        help="Model architecture (default: fasterrcnn, or ssdlite on MPS)",
+    )
     parser.add_argument("--max-dim", type=int, default=None, help="Downscale images so the longest side is <= this value (0 disables)")
     parser.add_argument("--min-size", type=int, default=None, help="Model transform min size (default varies by arch/device)")
     parser.add_argument("--max-size", type=int, default=None, help="Model transform max size (default varies by arch/device)")
+    parser.add_argument("--imgsz", type=int, default=None, help="YOLO image size (default: 640)")
+    parser.add_argument("--yolo-model", default="yolov8n.pt", help="YOLO base model or checkpoint (.pt)")
     return parser.parse_args()
 
 
@@ -55,6 +63,56 @@ def main():
     arch = args.arch
     if arch is None:
         arch = "ssdlite" if device.type == "mps" else "fasterrcnn"
+    if arch == "yolo":
+        device_arg = "cpu"
+        if device.type == "cuda":
+            device_arg = "0"
+        elif device.type == "mps":
+            device_arg = "mps"
+
+        imgsz = args.imgsz or 640
+        output_path = Path(args.output)
+        dataset_dir = output_path.parent / f"{output_path.stem}_yolo_data"
+        data_yaml, class_names = export_yolo_dataset(
+            coco_json,
+            images_dir,
+            dataset_dir,
+            val_split=args.val_split,
+            seed=args.seed,
+        )
+        try:
+            from ultralytics import YOLO
+        except ImportError as exc:
+            raise SystemExit("Ultralytics is required for YOLO training. Install with: pip install ultralytics") from exc
+
+        print("Using device:", device)
+        print(f"Architecture: yolo | imgsz: {imgsz} | base model: {args.yolo_model}")
+        print(f"YOLO dataset: {data_yaml}")
+
+        model = YOLO(args.yolo_model)
+        results = model.train(
+            data=str(data_yaml),
+            epochs=args.epochs,
+            imgsz=imgsz,
+            batch=args.batch_size,
+            device=device_arg,
+            project=str(output_path.parent),
+            name=output_path.stem,
+            exist_ok=True,
+        )
+
+        save_dir = Path(getattr(results, "save_dir", ""))
+        weights_dir = save_dir / "weights" if save_dir else output_path.parent / output_path.stem / "weights"
+        best_path = weights_dir / "best.pt"
+        if not best_path.exists():
+            best_path = weights_dir / "last.pt"
+        if not best_path.exists():
+            raise SystemExit(f"YOLO training finished but no weights found in {weights_dir}")
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(best_path, output_path)
+        print(f"Saved model to {output_path}")
+        return
 
     max_dim = args.max_dim
     if max_dim is None:

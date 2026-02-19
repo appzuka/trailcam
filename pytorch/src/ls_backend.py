@@ -17,7 +17,7 @@ from PIL import Image
 from torchvision.transforms import functional as F
 from torchvision.models.detection.transform import GeneralizedRCNNTransform
 
-from utils import COCODataset, build_model
+from utils import COCODataset, build_model, resolve_device
 
 
 def parse_args():
@@ -45,6 +45,13 @@ def parse_args():
     parser.add_argument("--weight-decay", type=float, default=0.0005)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--images-root", help="Override images root when training")
+    parser.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
+    parser.add_argument("--train-device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
+    parser.add_argument(
+        "--release-gpu-after-train",
+        action="store_true",
+        help="Move model to CPU after training to free GPU memory",
+    )
     return parser.parse_args()
 
 
@@ -327,9 +334,9 @@ def load_model(checkpoint_path: Path, device: torch.device):
     return model, class_names
 
 
-def detect(model, class_names, image_path: Path, threshold: float):
+def detect(model, class_names, image_path: Path, device: torch.device, threshold: float):
     image = Image.open(image_path).convert("RGB")
-    tensor = F.to_tensor(image)
+    tensor = F.to_tensor(image).to(device)
     with torch.no_grad():
         output = model([tensor])[0]
     boxes = output["boxes"].cpu()
@@ -363,6 +370,7 @@ def train_model(
     coco_json: Path,
     images_dir: Path,
     output_path: Path,
+    device: torch.device,
     epochs: int,
     batch_size: int,
     lr: float,
@@ -380,7 +388,6 @@ def train_model(
         collate_fn=lambda batch: tuple(zip(*batch)),
     )
 
-    device = torch.device("cpu")
     model = build_model(
         num_classes=num_classes,
         pretrained=True,
@@ -445,19 +452,21 @@ def parse_project_id(payload: Dict[str, Any], fallback: Optional[int]) -> Option
 
 
 class ModelStore:
-    def __init__(self, model, class_names):
+    def __init__(self, model, class_names, device: torch.device):
         self._model = model
         self._class_names = class_names
+        self._device = device
         self._lock = threading.Lock()
 
     def with_model(self):
         with self._lock:
-            return self._model, self._class_names
+            return self._model, self._class_names, self._device
 
-    def update(self, model, class_names):
+    def update(self, model, class_names, device: torch.device):
         with self._lock:
             self._model = model
             self._class_names = class_names
+            self._device = device
 
 
 class TrainingController:
@@ -505,6 +514,7 @@ class TrainingController:
                 coco_json,
                 images_dir,
                 output_path,
+                device=self._args.train_device,
                 epochs=self._args.epochs,
                 batch_size=self._args.batch_size,
                 lr=self._args.lr,
@@ -512,8 +522,14 @@ class TrainingController:
                 log_every=self._args.log_every,
             )
 
-            model, class_names = load_model(output_path, torch.device("cpu"))
-            self._store.update(model, class_names)
+            if self._args.release_gpu_after_train:
+                model, class_names = load_model(output_path, torch.device("cpu"))
+                self._store.update(model, class_names, torch.device("cpu"))
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            else:
+                model, class_names = load_model(output_path, self._args.device)
+                self._store.update(model, class_names, self._args.device)
             print("Training complete. Model updated.")
         except Exception as exc:
             print(f"Training failed: {exc}")
@@ -578,8 +594,8 @@ class BackendHandler(BaseHTTPRequestHandler):
                         self.server.label_studio_token,
                         self.server.label_studio_url,
                     )
-                    model, class_names = self.server.model_store.with_model()
-                    results = detect(model, class_names, image_path, self.server.threshold)
+                    model, class_names, device = self.server.model_store.with_model()
+                    results = detect(model, class_names, image_path, device, self.server.threshold)
                     for det in results:
                         detections.append(
                             {
@@ -645,10 +661,12 @@ class BackendServer(ThreadingHTTPServer):
 
 def main():
     args = parse_args()
+    args.device = resolve_device(args.device)
+    args.train_device = resolve_device(args.train_device)
     args.label_studio_token = resolve_token(args.label_studio_token)
 
-    model, class_names = load_model(Path(args.model), torch.device("cpu"))
-    model_store = ModelStore(model, class_names)
+    model, class_names = load_model(Path(args.model), args.device)
+    model_store = ModelStore(model, class_names, args.device)
     training = TrainingController(args, model_store)
 
     server = BackendServer((args.host, args.port), BackendHandler, model_store=model_store, training=training, args=args)

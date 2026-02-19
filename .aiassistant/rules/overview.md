@@ -136,3 +136,6 @@ This mode uses Vision image classification to detect a small set of animals and 
 
 ## ToDo
 - Add a train/validation split (and basic metrics reporting) to the PyTorch training pipeline.
+- Create a test dataset including tricky examples that is never used for training
+- Plan test for trained models to compare models, parameters, resolution for accuracy and speed
+- Make a utility to scan raw files and convert their name to the timestamp on the first frame

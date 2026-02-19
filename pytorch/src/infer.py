@@ -1,4 +1,5 @@
 import argparse
+import time
 import shutil
 import sys
 from pathlib import Path
@@ -13,14 +14,19 @@ from utils import build_model, resolve_device
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run inference with a trained Faster R-CNN model.")
-    parser.add_argument("--model", required=True, help="Path to model checkpoint (.pth)")
+    parser = argparse.ArgumentParser(description="Run inference with a trained detection model.")
+    parser.add_argument("--model", required=True, help="Path to model checkpoint (.pth/.pt)")
     parser.add_argument("--image", help="Path to a single image")
     parser.add_argument("--images-dir", help="Directory of images to run inference on")
     parser.add_argument("--score-threshold", type=float, default=0.5)
     parser.add_argument("--output-dir", help="Optional directory to save annotated images")
     parser.add_argument("--device", default="auto", choices=["auto", "cuda", "mps", "cpu"])
-    parser.add_argument("--arch", choices=["fasterrcnn", "ssdlite"], default=None, help="Model architecture (default: from checkpoint)")
+    parser.add_argument(
+        "--arch",
+        choices=["fasterrcnn", "ssdlite", "yolo"],
+        default=None,
+        help="Model architecture (default: from checkpoint)",
+    )
     parser.add_argument("--max-dim", type=int, default=None, help="Downscale images so the longest side is <= this value (0 disables)")
     parser.add_argument("--min-size", type=int, default=None, help="Model transform min size (default varies by arch/device)")
     parser.add_argument("--max-size", type=int, default=None, help="Model transform max size (default varies by arch/device)")
@@ -71,6 +77,52 @@ def load_checkpoint(
     model.to(device)
     model.eval()
     return model, class_names, architecture, checkpoint
+
+
+def yolo_device_arg(device: torch.device) -> str:
+    if device.type == "cuda":
+        return "0"
+    if device.type == "mps":
+        return "mps"
+    return "cpu"
+
+
+def load_yolo_model(path: Path):
+    try:
+        from ultralytics import YOLO
+    except ImportError as exc:
+        raise SystemExit("Ultralytics is required for YOLO inference. Install with: pip install ultralytics") from exc
+    return YOLO(str(path))
+
+
+def run_yolo_inference(model, image_path: Path, score_threshold: float, imgsz: int, device_arg: str):
+    original = Image.open(image_path).convert("RGB")
+    yolo_results = model.predict(
+        source=str(image_path),
+        conf=score_threshold,
+        imgsz=imgsz,
+        device=device_arg,
+        verbose=False,
+    )
+    results = []
+    if yolo_results:
+        result = yolo_results[0]
+        boxes = result.boxes
+        names = result.names or getattr(model, "names", {})
+        if boxes is not None and boxes.xyxy is not None:
+            xyxy = boxes.xyxy.cpu().numpy()
+            confs = boxes.conf.cpu().numpy() if boxes.conf is not None else None
+            clss = boxes.cls.cpu().numpy().astype(int) if boxes.cls is not None else None
+            for idx in range(len(xyxy)):
+                cls_idx = int(clss[idx]) if clss is not None else idx
+                if isinstance(names, dict):
+                    name = names.get(cls_idx, str(cls_idx))
+                else:
+                    name = names[cls_idx] if cls_idx < len(names) else str(cls_idx)
+                score = float(confs[idx]) if confs is not None else 0.0
+                results.append((name, score, [float(x) for x in xyxy[idx].tolist()]))
+    results.sort(key=lambda item: item[1], reverse=True)
+    return original, {}, results
 
 
 def list_images(images_dir: Path):
@@ -390,44 +442,51 @@ def main():
     print(f"Using device: {device}")
 
     model_path = Path(args.model)
-    checkpoint = torch.load(model_path, map_location="cpu")
-    arch = args.arch or checkpoint.get("architecture") or "fasterrcnn"
-    ssdlite_backbone_weights = checkpoint.get("ssdlite_backbone_weights")
-    if arch == "ssdlite" and ssdlite_backbone_weights is None:
-        ssdlite_backbone_weights = infer_ssdlite_backbone_flag(checkpoint.get("model_state", {}))
+    if args.arch == "yolo":
+        arch = "yolo"
+        model = load_yolo_model(model_path)
+        device_arg = yolo_device_arg(device)
+        max_dim = args.max_dim or 640
+        print(f"Architecture: yolo | imgsz: {max_dim}")
+    else:
+        checkpoint = torch.load(model_path, map_location="cpu")
+        arch = args.arch or checkpoint.get("architecture") or "fasterrcnn"
+        ssdlite_backbone_weights = checkpoint.get("ssdlite_backbone_weights")
+        if arch == "ssdlite" and ssdlite_backbone_weights is None:
+            ssdlite_backbone_weights = infer_ssdlite_backbone_flag(checkpoint.get("model_state", {}))
 
-    max_dim = args.max_dim
-    if max_dim is None:
-        if arch == "ssdlite":
-            max_dim = 320
-        else:
-            max_dim = 768 if device.type == "mps" else 1024
+        max_dim = args.max_dim
+        if max_dim is None:
+            if arch == "ssdlite":
+                max_dim = 320
+            else:
+                max_dim = 768 if device.type == "mps" else 1024
 
-    min_size = args.min_size
-    max_size = args.max_size
-    if min_size is None:
-        if arch == "ssdlite":
-            min_size = 320
-        else:
-            min_size = 512 if device.type == "mps" else 800
-    if max_size is None:
-        if arch == "ssdlite":
-            max_size = 320
-        else:
-            max_size = 768 if device.type == "mps" else 1333
+        min_size = args.min_size
+        max_size = args.max_size
+        if min_size is None:
+            if arch == "ssdlite":
+                min_size = 320
+            else:
+                min_size = 512 if device.type == "mps" else 800
+        if max_size is None:
+            if arch == "ssdlite":
+                max_size = 320
+            else:
+                max_size = 768 if device.type == "mps" else 1333
 
-    model, class_names, resolved_arch, _ = load_checkpoint(
-        model_path,
-        device,
-        min_size,
-        max_size,
-        arch,
-        ssdlite_backbone_weights,
-    )
-    print(
-        f"Architecture: {resolved_arch} | max-dim: {max_dim} | min-size: {min_size} | max-size: {max_size} | "
-        f"ssdlite_backbone_weights: {ssdlite_backbone_weights}"
-    )
+        model, class_names, resolved_arch, _ = load_checkpoint(
+            model_path,
+            device,
+            min_size,
+            max_size,
+            arch,
+            ssdlite_backbone_weights,
+        )
+        print(
+            f"Architecture: {resolved_arch} | max-dim: {max_dim} | min-size: {min_size} | max-size: {max_size} | "
+            f"ssdlite_backbone_weights: {ssdlite_backbone_weights}"
+        )
 
     if args.image is None and args.images_dir is None:
         raise SystemExit("Provide --image or --images-dir")
@@ -449,6 +508,9 @@ def main():
             if not args.box:
                 print("Skipping video (use --box to process videos).")
                 continue
+            if arch == "yolo":
+                print("Skipping video (YOLO video inference not implemented).")
+                continue
             dest_root = Path(args.images_dir) if args.images_dir else image_path.parent
             process_video(
                 image_path,
@@ -460,17 +522,27 @@ def main():
                 dest_root,
             )
             continue
+        start_time = time.perf_counter()
         try:
-            image, detections, results = run_inference(
-                model,
-                class_names,
-                image_path,
-                device,
-                args.score_threshold,
-                max_dim,
-            )
+            if arch == "yolo":
+                image, detections, results = run_yolo_inference(
+                    model,
+                    image_path,
+                    args.score_threshold,
+                    max_dim,
+                    device_arg,
+                )
+            else:
+                image, detections, results = run_inference(
+                    model,
+                    class_names,
+                    image_path,
+                    device,
+                    args.score_threshold,
+                    max_dim,
+                )
         except RuntimeError as exc:
-            if device.type != "mps" or max_dim <= 512:
+            if arch == "yolo" or device.type != "mps" or max_dim <= 512:
                 raise
             reduced = max(512, int(max_dim * 0.75))
             print(f"MPS error detected, retrying with --max-dim {reduced}")
@@ -482,12 +554,14 @@ def main():
                 args.score_threshold,
                 reduced,
             )
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+        timing_note = f" ({elapsed_ms:.1f} ms)"
         if results:
             top_results = results[:5]
             summary = ", ".join([f"{name} ({score:.2f})" for name, score, _ in top_results])
-            print(f"Top 5: {summary}")
+            print(f"Top 5: {summary}{timing_note}")
         else:
-            print("Top 5: no detections")
+            print(f"Top 5: no detections{timing_note}")
 
         annotated = None
         if args.box:
